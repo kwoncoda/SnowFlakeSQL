@@ -33,7 +33,8 @@ try:
 except Exception:
     SNOW_OK = False
 
-MOCK_MODE = {}  # 화면별로 mock 사용 여부 기록 → 상단 배지에 표시
+MOCK_MODE = {}   # 화면별로 mock 사용 여부 기록 → 상단 배지에 표시
+LOAD_ERRORS = {}  # 화면별로 실패 이유 기록 → 디버깅용
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -50,8 +51,8 @@ def load(view_name: str) -> pd.DataFrame:
             df = session.table(f"{FULL_SCHEMA}.{view_name}").to_pandas()
             MOCK_MODE[view_name] = False
             return df
-        except Exception:
-            pass
+        except Exception as e:
+            LOAD_ERRORS[view_name] = str(e)
     MOCK_MODE[view_name] = True
     return MOCK.get(view_name, pd.DataFrame()).copy()
 
@@ -60,7 +61,13 @@ def status_badge(view_name: str):
     """이 화면이 mock인지 실데이터인지 표시"""
     is_mock = MOCK_MODE.get(view_name, True)
     if is_mock:
-        st.caption(f"🟡 MOCK 데이터 사용 중 — `{view_name}` 아직 없음. 태운 님 작업 완료 후 자동 전환됩니다.")
+        err = LOAD_ERRORS.get(view_name)
+        if err:
+            st.caption(f"🟡 MOCK 데이터 사용 중 — `{view_name}` 연결 실패")
+            with st.expander(f"⚠ {view_name} 실패 원인 보기", expanded=False):
+                st.code(err[:500])
+        else:
+            st.caption(f"🟡 MOCK 데이터 사용 중 — `{view_name}` 아직 없음. 태운 님 작업 완료 후 자동 전환됩니다.")
     else:
         st.caption(f"🟢 실데이터 — `{view_name}`")
 
@@ -107,52 +114,120 @@ MOCK["V_ANGLE_SENSITIVITY"] = pd.DataFrame({
     "N_OPPO":      [58, 92, 143, 217, 330],
 })
 
-# V_PLACEBO_SUMMARY — 효린 담당, 지표별 위약검정 통과여부 통합표
+# V_PLACEBO_SUMMARY — 실제 SQL 재생성분 기준 (컬럼명 TEST_NAME/OBSERVED_VALUE로 변경됨)
+# 경쟁재 비중 항목이 빠지고 HHI 다양성으로 교체됨. 폐업률/각도회귀 위약값도 재계산되어 소폭 변경.
 MOCK["V_PLACEBO_SUMMARY"] = pd.DataFrame({
-    "METRIC":        ["폐업률 (0-300m)", "각도회귀 클러스터SE", "생활밀착 비중", "보완재 비중", "경쟁재 비중", "프랜차이즈 비중(전체)"],
-    "OBSERVED":      ["-7.02%p", "p=0.575", "-1.79%p", "+3.69%p", "+1.59%p", "+5.93%p"],
-    "PLACEBO_RANK":  ["하위 36.7%", "-", "하위 11.7% (중심점 20.0%)", "상위 3.3%", "상위 43.3%", "상위 10.0%"],
-    "VERDICT":       ["기각", "기각", "기각", "통과", "기각", "통과"],
+    "TEST_NAME":      ["폐업률 -7.0%p", "각도 회귀 (클러스터 SE)", "HHI 다양성", "보완재 비중", "생활밀착 비중", "프랜차이즈 비중"],
+    "OBSERVED_VALUE": ["-7.0%p", "p=0.496", "-672", "+3.69%p", "-1.79%p", "+5.93%p"],
+    "PLACEBO_RANK":   ["하위 23.3%", "-", "상위 71.7%", "상위 3.3%", "하위 11.7%", "상위 10.0%"],
+    "VERDICT":        ["기각", "기각", "기각", "통과", "경계", "통과"],
 })
 
-# V_ROLE_TREND — 실패3, 연도×방향 업종비율
-MOCK["V_ROLE_TREND"] = pd.DataFrame({
-    "YR":            [2021, 2022, 2023, 2024, 2025, 2026] * 2,
-    "SECTOR":        ["성심당방향"] * 6 + ["반대방향"] * 6,
-    "N":             [677, 634, 356, 396, 482, 457, 238, 239, 237, 260, 229, 212],
-    "LIFE_RATIO":    [0.0502, 0.0489, 0.0365, 0.0354, 0.0436, 0.0416,
-                       0.0756, 0.0753, 0.0844, 0.0731, 0.0830, 0.0849],
-    "SUPPORT_RATIO": [0.1802, 0.2003, 0.3539, 0.2955, 0.2158, 0.2210,
-                       0.1471, 0.1548, 0.1603, 0.1538, 0.1528, 0.1509],
-    "COMPETE_RATIO": [0.0487, 0.0473, 0.0787, 0.0808, 0.0643, 0.0635,
-                       0.0672, 0.0669, 0.0717, 0.0654, 0.0699, 0.0660],
-})
+# V_ROLE_TREND — 실패3, 연도×방향 업종비율 (long format: YR,SECTOR,ROLE,N,TOTAL_N,PCT)
+_role_years   = [2021, 2022, 2023, 2024, 2025, 2026]
+_role_sectors = ["성심당방향", "반대방향"]
+_role_total_n = {"성심당방향": [677, 634, 356, 396, 482, 457],
+                  "반대방향":   [238, 239, 237, 260, 229, 212]}
+_role_pct = {
+    "생활밀착": {"성심당방향": [5.02, 4.89, 3.65, 3.54, 4.36, 4.16],
+                "반대방향":   [7.56, 7.53, 8.44, 7.31, 8.30, 8.49]},
+    "보완재":   {"성심당방향": [18.02, 20.03, 35.39, 29.55, 21.58, 22.10],
+                "반대방향":   [14.71, 15.48, 16.03, 15.38, 15.28, 15.09]},
+    "경쟁재":   {"성심당방향": [4.87, 4.73, 7.87, 8.08, 6.43, 6.35],
+                "반대방향":   [6.72, 6.69, 7.17, 6.54, 6.99, 6.60]},
+}
+_rows = []
+for role, sec_map in _role_pct.items():
+    for sector in _role_sectors:
+        for i, yr in enumerate(_role_years):
+            total_n = _role_total_n[sector][i]
+            pct = sec_map[sector][i]
+            _rows.append({"YR": yr, "SECTOR": sector, "ROLE": role,
+                          "N": round(total_n * pct / 100), "TOTAL_N": total_n, "PCT": pct})
+MOCK["V_ROLE_TREND"] = pd.DataFrame(_rows)
 
-# V_BRANCH_TREND — 프랜차이즈 비중 추이 (전체 업종 기준, 위약검정 통과)
-# 2023년: 보정 전 5.90%(파싱 오류) → 보정 후 25.84%로 복구
-MOCK["V_BRANCH_TREND"] = pd.DataFrame({
-    "YR":            [2021, 2022, 2023, 2024, 2025, 2026] * 2,
-    "SECTOR":        ["성심당방향"] * 6 + ["반대방향"] * 6,
-    "N":             [400, 380, 340, 350, 400, 390, 150, 155, 160, 170, 165, 160],
-    "BRANCH_RATIO":  [0.1581, 0.1672, 0.2584, 0.2374, 0.2104, 0.2013,
-                       0.1387, 0.1506, 0.1350, 0.1192, 0.1228, 0.1226],
-})
+# V_BRANCH_TREND — 실측치 그대로 (long format: YR,SECTOR,ROLE,N,K,BRANCH_PCT,CI_LO_PCT,CI_HI_PCT)
+MOCK["V_BRANCH_TREND"] = pd.DataFrame([
+    {"YR": 2021, "SECTOR": "반대방향", "ROLE": "경쟁재", "N": 16, "K": 3, "BRANCH_PCT": 18.75, "CI_LO_PCT": 6.59, "CI_HI_PCT": 43.01},
+    {"YR": 2021, "SECTOR": "반대방향", "ROLE": "기타", "N": 70, "K": 2, "BRANCH_PCT": 2.86, "CI_LO_PCT": 0.79, "CI_HI_PCT": 9.83},
+    {"YR": 2021, "SECTOR": "반대방향", "ROLE": "보완재", "N": 35, "K": 1, "BRANCH_PCT": 2.86, "CI_LO_PCT": 0.51, "CI_HI_PCT": 14.53},
+    {"YR": 2021, "SECTOR": "반대방향", "ROLE": "생활기타", "N": 3, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 56.15},
+    {"YR": 2021, "SECTOR": "반대방향", "ROLE": "생활밀착", "N": 18, "K": 3, "BRANCH_PCT": 16.67, "CI_LO_PCT": 5.84, "CI_HI_PCT": 39.22},
+    {"YR": 2021, "SECTOR": "반대방향", "ROLE": "소매", "N": 96, "K": 24, "BRANCH_PCT": 25.0, "CI_LO_PCT": 17.41, "CI_HI_PCT": 34.51},
+    {"YR": 2021, "SECTOR": "성심당방향", "ROLE": "경쟁재", "N": 33, "K": 12, "BRANCH_PCT": 36.36, "CI_LO_PCT": 22.19, "CI_HI_PCT": 53.38},
+    {"YR": 2021, "SECTOR": "성심당방향", "ROLE": "기타", "N": 97, "K": 14, "BRANCH_PCT": 14.43, "CI_LO_PCT": 8.8, "CI_HI_PCT": 22.78},
+    {"YR": 2021, "SECTOR": "성심당방향", "ROLE": "보완재", "N": 122, "K": 38, "BRANCH_PCT": 31.15, "CI_LO_PCT": 23.61, "CI_HI_PCT": 39.83},
+    {"YR": 2021, "SECTOR": "성심당방향", "ROLE": "생활기타", "N": 4, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 48.99},
+    {"YR": 2021, "SECTOR": "성심당방향", "ROLE": "생활밀착", "N": 34, "K": 1, "BRANCH_PCT": 2.94, "CI_LO_PCT": 0.52, "CI_HI_PCT": 14.92},
+    {"YR": 2021, "SECTOR": "성심당방향", "ROLE": "소매", "N": 387, "K": 42, "BRANCH_PCT": 10.85, "CI_LO_PCT": 8.13, "CI_HI_PCT": 14.35},
+    {"YR": 2022, "SECTOR": "반대방향", "ROLE": "경쟁재", "N": 16, "K": 3, "BRANCH_PCT": 18.75, "CI_LO_PCT": 6.59, "CI_HI_PCT": 43.01},
+    {"YR": 2022, "SECTOR": "반대방향", "ROLE": "기타", "N": 69, "K": 2, "BRANCH_PCT": 2.9, "CI_LO_PCT": 0.8, "CI_HI_PCT": 9.97},
+    {"YR": 2022, "SECTOR": "반대방향", "ROLE": "보완재", "N": 37, "K": 3, "BRANCH_PCT": 8.11, "CI_LO_PCT": 2.8, "CI_HI_PCT": 21.3},
+    {"YR": 2022, "SECTOR": "반대방향", "ROLE": "생활기타", "N": 2, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 65.76},
+    {"YR": 2022, "SECTOR": "반대방향", "ROLE": "생활밀착", "N": 18, "K": 3, "BRANCH_PCT": 16.67, "CI_LO_PCT": 5.84, "CI_HI_PCT": 39.22},
+    {"YR": 2022, "SECTOR": "반대방향", "ROLE": "소매", "N": 97, "K": 25, "BRANCH_PCT": 25.77, "CI_LO_PCT": 18.11, "CI_HI_PCT": 35.28},
+    {"YR": 2022, "SECTOR": "성심당방향", "ROLE": "경쟁재", "N": 30, "K": 12, "BRANCH_PCT": 40.0, "CI_LO_PCT": 24.59, "CI_HI_PCT": 57.68},
+    {"YR": 2022, "SECTOR": "성심당방향", "ROLE": "기타", "N": 92, "K": 14, "BRANCH_PCT": 15.22, "CI_LO_PCT": 9.29, "CI_HI_PCT": 23.94},
+    {"YR": 2022, "SECTOR": "성심당방향", "ROLE": "보완재", "N": 127, "K": 40, "BRANCH_PCT": 31.5, "CI_LO_PCT": 24.06, "CI_HI_PCT": 40.02},
+    {"YR": 2022, "SECTOR": "성심당방향", "ROLE": "생활기타", "N": 6, "K": 1, "BRANCH_PCT": 16.67, "CI_LO_PCT": 3.01, "CI_HI_PCT": 56.35},
+    {"YR": 2022, "SECTOR": "성심당방향", "ROLE": "생활밀착", "N": 31, "K": 1, "BRANCH_PCT": 3.23, "CI_LO_PCT": 0.57, "CI_HI_PCT": 16.19},
+    {"YR": 2022, "SECTOR": "성심당방향", "ROLE": "소매", "N": 348, "K": 38, "BRANCH_PCT": 10.92, "CI_LO_PCT": 8.06, "CI_HI_PCT": 14.63},
+    {"YR": 2023, "SECTOR": "반대방향", "ROLE": "경쟁재", "N": 17, "K": 1, "BRANCH_PCT": 5.88, "CI_LO_PCT": 1.05, "CI_HI_PCT": 26.98},
+    {"YR": 2023, "SECTOR": "반대방향", "ROLE": "기타", "N": 62, "K": 2, "BRANCH_PCT": 3.23, "CI_LO_PCT": 0.89, "CI_HI_PCT": 11.02},
+    {"YR": 2023, "SECTOR": "반대방향", "ROLE": "보완재", "N": 38, "K": 5, "BRANCH_PCT": 13.16, "CI_LO_PCT": 5.75, "CI_HI_PCT": 27.33},
+    {"YR": 2023, "SECTOR": "반대방향", "ROLE": "생활기타", "N": 2, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 65.76},
+    {"YR": 2023, "SECTOR": "반대방향", "ROLE": "생활밀착", "N": 20, "K": 3, "BRANCH_PCT": 15.0, "CI_LO_PCT": 5.24, "CI_HI_PCT": 36.04},
+    {"YR": 2023, "SECTOR": "반대방향", "ROLE": "소매", "N": 98, "K": 21, "BRANCH_PCT": 21.43, "CI_LO_PCT": 14.46, "CI_HI_PCT": 30.55},
+    {"YR": 2023, "SECTOR": "성심당방향", "ROLE": "경쟁재", "N": 28, "K": 12, "BRANCH_PCT": 42.86, "CI_LO_PCT": 26.51, "CI_HI_PCT": 60.93},
+    {"YR": 2023, "SECTOR": "성심당방향", "ROLE": "기타", "N": 84, "K": 17, "BRANCH_PCT": 20.24, "CI_LO_PCT": 13.04, "CI_HI_PCT": 30.04},
+    {"YR": 2023, "SECTOR": "성심당방향", "ROLE": "보완재", "N": 126, "K": 43, "BRANCH_PCT": 34.13, "CI_LO_PCT": 26.43, "CI_HI_PCT": 42.77},
+    {"YR": 2023, "SECTOR": "성심당방향", "ROLE": "생활기타", "N": 6, "K": 1, "BRANCH_PCT": 16.67, "CI_LO_PCT": 3.01, "CI_HI_PCT": 56.35},
+    {"YR": 2023, "SECTOR": "성심당방향", "ROLE": "생활밀착", "N": 13, "K": 1, "BRANCH_PCT": 7.69, "CI_LO_PCT": 1.37, "CI_HI_PCT": 33.31},
+    {"YR": 2023, "SECTOR": "성심당방향", "ROLE": "소매", "N": 99, "K": 18, "BRANCH_PCT": 18.18, "CI_LO_PCT": 11.82, "CI_HI_PCT": 26.92},
+    {"YR": 2024, "SECTOR": "반대방향", "ROLE": "경쟁재", "N": 15, "K": 2, "BRANCH_PCT": 13.33, "CI_LO_PCT": 3.74, "CI_HI_PCT": 37.88},
+    {"YR": 2024, "SECTOR": "반대방향", "ROLE": "기타", "N": 72, "K": 1, "BRANCH_PCT": 1.39, "CI_LO_PCT": 0.25, "CI_HI_PCT": 7.46},
+    {"YR": 2024, "SECTOR": "반대방향", "ROLE": "보완재", "N": 40, "K": 3, "BRANCH_PCT": 7.5, "CI_LO_PCT": 2.58, "CI_HI_PCT": 19.86},
+    {"YR": 2024, "SECTOR": "반대방향", "ROLE": "생활기타", "N": 2, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 65.76},
+    {"YR": 2024, "SECTOR": "반대방향", "ROLE": "생활밀착", "N": 19, "K": 3, "BRANCH_PCT": 15.79, "CI_LO_PCT": 5.52, "CI_HI_PCT": 37.57},
+    {"YR": 2024, "SECTOR": "반대방향", "ROLE": "소매", "N": 112, "K": 22, "BRANCH_PCT": 19.64, "CI_LO_PCT": 13.34, "CI_HI_PCT": 27.95},
+    {"YR": 2024, "SECTOR": "성심당방향", "ROLE": "경쟁재", "N": 32, "K": 15, "BRANCH_PCT": 46.88, "CI_LO_PCT": 30.87, "CI_HI_PCT": 63.55},
+    {"YR": 2024, "SECTOR": "성심당방향", "ROLE": "기타", "N": 107, "K": 23, "BRANCH_PCT": 21.5, "CI_LO_PCT": 14.77, "CI_HI_PCT": 30.19},
+    {"YR": 2024, "SECTOR": "성심당방향", "ROLE": "보완재", "N": 117, "K": 34, "BRANCH_PCT": 29.06, "CI_LO_PCT": 21.6, "CI_HI_PCT": 37.85},
+    {"YR": 2024, "SECTOR": "성심당방향", "ROLE": "생활기타", "N": 5, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 43.45},
+    {"YR": 2024, "SECTOR": "성심당방향", "ROLE": "생활밀착", "N": 14, "K": 3, "BRANCH_PCT": 21.43, "CI_LO_PCT": 7.57, "CI_HI_PCT": 47.59},
+    {"YR": 2024, "SECTOR": "성심당방향", "ROLE": "소매", "N": 121, "K": 19, "BRANCH_PCT": 15.7, "CI_LO_PCT": 10.29, "CI_HI_PCT": 23.23},
+    {"YR": 2025, "SECTOR": "반대방향", "ROLE": "경쟁재", "N": 16, "K": 2, "BRANCH_PCT": 12.5, "CI_LO_PCT": 3.5, "CI_HI_PCT": 36.02},
+    {"YR": 2025, "SECTOR": "반대방향", "ROLE": "기타", "N": 61, "K": 1, "BRANCH_PCT": 1.64, "CI_LO_PCT": 0.29, "CI_HI_PCT": 8.72},
+    {"YR": 2025, "SECTOR": "반대방향", "ROLE": "보완재", "N": 35, "K": 1, "BRANCH_PCT": 2.86, "CI_LO_PCT": 0.51, "CI_HI_PCT": 14.53},
+    {"YR": 2025, "SECTOR": "반대방향", "ROLE": "생활기타", "N": 2, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 65.76},
+    {"YR": 2025, "SECTOR": "반대방향", "ROLE": "생활밀착", "N": 18, "K": 3, "BRANCH_PCT": 16.67, "CI_LO_PCT": 5.84, "CI_HI_PCT": 39.22},
+    {"YR": 2025, "SECTOR": "반대방향", "ROLE": "소매", "N": 96, "K": 21, "BRANCH_PCT": 21.88, "CI_LO_PCT": 14.78, "CI_HI_PCT": 31.14},
+    {"YR": 2025, "SECTOR": "성심당방향", "ROLE": "경쟁재", "N": 31, "K": 13, "BRANCH_PCT": 41.94, "CI_LO_PCT": 26.42, "CI_HI_PCT": 59.23},
+    {"YR": 2025, "SECTOR": "성심당방향", "ROLE": "기타", "N": 100, "K": 24, "BRANCH_PCT": 24.0, "CI_LO_PCT": 16.69, "CI_HI_PCT": 33.23},
+    {"YR": 2025, "SECTOR": "성심당방향", "ROLE": "보완재", "N": 104, "K": 34, "BRANCH_PCT": 32.69, "CI_LO_PCT": 24.43, "CI_HI_PCT": 42.18},
+    {"YR": 2025, "SECTOR": "성심당방향", "ROLE": "생활기타", "N": 3, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 56.15},
+    {"YR": 2025, "SECTOR": "성심당방향", "ROLE": "생활밀착", "N": 21, "K": 3, "BRANCH_PCT": 14.29, "CI_LO_PCT": 4.98, "CI_HI_PCT": 34.64},
+    {"YR": 2025, "SECTOR": "성심당방향", "ROLE": "소매", "N": 221, "K": 27, "BRANCH_PCT": 12.22, "CI_LO_PCT": 8.53, "CI_HI_PCT": 17.19},
+    {"YR": 2026, "SECTOR": "반대방향", "ROLE": "경쟁재", "N": 14, "K": 1, "BRANCH_PCT": 7.14, "CI_LO_PCT": 1.27, "CI_HI_PCT": 31.47},
+    {"YR": 2026, "SECTOR": "반대방향", "ROLE": "기타", "N": 57, "K": 1, "BRANCH_PCT": 1.75, "CI_LO_PCT": 0.31, "CI_HI_PCT": 9.29},
+    {"YR": 2026, "SECTOR": "반대방향", "ROLE": "보완재", "N": 32, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 10.72},
+    {"YR": 2026, "SECTOR": "반대방향", "ROLE": "생활기타", "N": 2, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 65.76},
+    {"YR": 2026, "SECTOR": "반대방향", "ROLE": "생활밀착", "N": 18, "K": 3, "BRANCH_PCT": 16.67, "CI_LO_PCT": 5.84, "CI_HI_PCT": 39.22},
+    {"YR": 2026, "SECTOR": "반대방향", "ROLE": "소매", "N": 89, "K": 21, "BRANCH_PCT": 23.6, "CI_LO_PCT": 15.98, "CI_HI_PCT": 33.39},
+    {"YR": 2026, "SECTOR": "성심당방향", "ROLE": "경쟁재", "N": 29, "K": 12, "BRANCH_PCT": 41.38, "CI_LO_PCT": 25.51, "CI_HI_PCT": 59.26},
+    {"YR": 2026, "SECTOR": "성심당방향", "ROLE": "기타", "N": 95, "K": 23, "BRANCH_PCT": 24.21, "CI_LO_PCT": 16.71, "CI_HI_PCT": 33.72},
+    {"YR": 2026, "SECTOR": "성심당방향", "ROLE": "보완재", "N": 101, "K": 31, "BRANCH_PCT": 30.69, "CI_LO_PCT": 22.54, "CI_HI_PCT": 40.26},
+    {"YR": 2026, "SECTOR": "성심당방향", "ROLE": "생활기타", "N": 4, "K": 0, "BRANCH_PCT": 0.0, "CI_LO_PCT": 0.0, "CI_HI_PCT": 48.99},
+    {"YR": 2026, "SECTOR": "성심당방향", "ROLE": "생활밀착", "N": 19, "K": 2, "BRANCH_PCT": 10.53, "CI_LO_PCT": 2.94, "CI_HI_PCT": 31.39},
+    {"YR": 2026, "SECTOR": "성심당방향", "ROLE": "소매", "N": 209, "K": 24, "BRANCH_PCT": 11.48, "CI_LO_PCT": 7.84, "CI_HI_PCT": 16.52},
+])
 
-# V_BRANCH_COMPETE — 경쟁재(카페·제과) 한정 프랜차이즈 비중 (참고용, 표본 작음)
-# 위약검정 미실시. 개별 연도 95% CI가 겹쳐 단독으로는 유의성 주장 불가.
-MOCK["V_BRANCH_COMPETE"] = pd.DataFrame({
-    "YR":       [2021, 2022, 2023, 2024, 2025, 2026],
-    "ANCHOR_PCT": [36.4, 40.0, 42.9, 46.9, 41.9, 41.4],
-    "ANCHOR_N":   [33, 30, 28, 32, 31, 29],
-    "OPPO_PCT":   [18.8, 18.8, 5.9, 13.3, 12.5, 7.1],
-    "OPPO_N":     [16, 16, 17, 15, 16, 14],
-})
 
 # V_RENT_INDEX — 대전 5개 상권 임대가격지수 (실측, 한국부동산원)
 # 전 상권 하락 국면. 원도심은 5개 중 4번째(중간~하락 쪽) — "안정적"이 아님
 MOCK["V_RENT_INDEX"] = pd.DataFrame({
     "QTR": ["2024Q2", "2024Q3", "2024Q4", "2025Q1", "2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2"] * 5,
-    "DISTRICT": (["원도심"] * 9 + ["서대전네거리"] * 9 + ["용문한민시장"] * 9
+    "DISTRICT": (["대전원도심"] * 9 + ["서대전네거리"] * 9 + ["용문한민시장"] * 9
                  + ["복합터미널"] * 9 + ["노은"] * 9),
     "RENT_INDEX_CHG_PP": [
         0.00, -0.11, -0.21, -0.06, -0.16, -0.50, -0.56, -0.58, -0.59,   # 원도심
@@ -359,25 +434,37 @@ with st.container(border=True):
     chart7_df = df7.pivot(index="QTR", columns="DISTRICT", values="RENT_INDEX_CHG_PP")
     st.line_chart(chart7_df, height=380)
 
-    wondosim = df7[df7.DISTRICT == "원도심"].iloc[-1]
-    rank = df7[df7.QTR == df7.QTR.max()].sort_values("RENT_INDEX_CHG_PP", ascending=False)
-    rank_pos = list(rank.DISTRICT).index("원도심") + 1
-    st.metric("원도심 임대료 변화 (2024Q2→2026Q2)", f"{wondosim.RENT_INDEX_CHG_PP:+.2f}%p",
-              delta=f"대전 5개 상권 중 낙폭 {rank_pos}번째로 작음 (상대적으로 안정)",
-              delta_color="off")
+    latest_q = df7.QTR.max()
+    rank = df7[df7.QTR == latest_q].sort_values("RENT_INDEX_CHG_PP", ascending=False)
+    wondo_rows = rank[rank.DISTRICT == "대전원도심"]
+    if len(wondo_rows) > 0:
+        wondosim = wondo_rows.iloc[0]
+        rank_pos = list(rank.DISTRICT).index("대전원도심") + 1
+        st.metric("원도심 임대료 변화 (2024Q2→2026Q2)", f"{wondosim.RENT_INDEX_CHG_PP:+.2f}%p",
+                  delta=f"대전 {len(rank)}개 상권 중 낙폭 {rank_pos}번째로 작음 (상대적으로 안정)",
+                  delta_color="off")
+    else:
+        rank_pos = None
+        st.caption(f"⚠ 최신 분기({latest_q})에 '대전원도심' 데이터가 없습니다 — DISTRICT 값을 확인해주세요.")
 
     df7b = load("V_ROLE_TREND")
     if len(df7b) > 0:
-        life21 = df7b[(df7b.YR == 2021) & (df7b.SECTOR == "성심당방향")].LIFE_RATIO.values
-        life26 = df7b[(df7b.YR == 2026) & (df7b.SECTOR == "성심당방향")].LIFE_RATIO.values
-        if len(life21) and len(life26):
+        def _role_pct(df, yr, sector, role):
+            row = df[(df.YR == yr) & (df.SECTOR == sector) & (df.ROLE == role)]
+            return float(row.PCT.iloc[0]) if len(row) else None
+        life21 = _role_pct(df7b, 2021, "성심당방향", "생활밀착")
+        life26 = _role_pct(df7b, 2026, "성심당방향", "생활밀착")
+        if life21 is not None and life26 is not None:
             st.metric("생활밀착업종 비율 (성심당방향)",
-                      f"{life26[0]*100:.2f}%",
-                      delta=f"{(life26[0]-life21[0])*100:+.2f}%p (2021 대비)")
+                      f"{life26:.2f}%",
+                      delta=f"{(life26-life21):+.2f}%p (2021 대비)")
+        else:
+            st.caption("⚠ V_ROLE_TREND에서 ROLE='생활밀착' 값을 찾지 못했습니다 — 실제 ROLE 값을 확인해주세요.")
 
-    st.markdown(f"> **대전 5개 상권 전체가 하락 국면이며, 원도심은 그중 낙폭이 {rank_pos}번째로 작다(비교적 안정적).** "
-                "원도심만 특별히 임대료가 오르거나 유독 불안정한 게 아니다. "
-                "생활밀착업종도 급격히 사라지지 않았다. **경리단길형(임대료發) 젠트리피케이션은 아니다.**")
+    if rank_pos is not None:
+        st.markdown(f"> **대전 5개 상권 전체가 하락 국면이며, 원도심은 그중 낙폭이 {rank_pos}번째로 작다(비교적 안정적).** "
+                    "원도심만 특별히 임대료가 오르거나 유독 불안정한 게 아니다. "
+                    "생활밀착업종도 급격히 사라지지 않았다. **경리단길형(임대료發) 젠트리피케이션은 아니다.**")
 
 
 # =====================================================================
@@ -389,37 +476,70 @@ with st.container(border=True):
     df8 = load("V_BRANCH_TREND")
     status_badge("V_BRANCH_TREND")
 
-    chart8_df = df8.pivot(index="YR", columns="SECTOR", values="BRANCH_RATIO") * 100
+    # 업종(ROLE) 전체를 합산해 "전체 업종 기준 프랜차이즈 비중" 계산
+    agg = df8.groupby(["YR", "SECTOR"], as_index=False)[["N", "K"]].sum()
+    agg["PCT"] = agg["K"] / agg["N"] * 100
+
+    chart8_df = agg.pivot(index="YR", columns="SECTOR", values="PCT")
     st.line_chart(chart8_df, height=400)
 
-    a21 = df8[(df8.YR == 2021) & (df8.SECTOR == "성심당방향")].BRANCH_RATIO.values[0]
-    a26 = df8[(df8.YR == 2026) & (df8.SECTOR == "성심당방향")].BRANCH_RATIO.values[0]
-    b21 = df8[(df8.YR == 2021) & (df8.SECTOR == "반대방향")].BRANCH_RATIO.values[0]
-    b26 = df8[(df8.YR == 2026) & (df8.SECTOR == "반대방향")].BRANCH_RATIO.values[0]
+    def _agg_pct(yr, sector):
+        row = agg[(agg.YR == yr) & (agg.SECTOR == sector)]
+        return float(row.PCT.iloc[0]) if len(row) else None
 
-    c1, c2 = st.columns(2)
-    c1.metric("성심당 방향 (2021→2026)", f"{a26*100:.1f}%", delta=f"{(a26-a21)*100:+.1f}%p")
-    c2.metric("반대 방향 (2021→2026)", f"{b26*100:.1f}%", delta=f"{(b26-b21)*100:+.1f}%p")
+    a21, a26 = _agg_pct(2021, "성심당방향"), _agg_pct(2026, "성심당방향")
+    b21, b26 = _agg_pct(2021, "반대방향"), _agg_pct(2026, "반대방향")
 
-    st.success(f"격차가 {(a21-b21)*100:+.1f}%p → {(a26-b26)*100:+.1f}%p로 벌어졌다. "
-               "위약 검정 상위 10.0%로 통과.")
+    if None not in (a21, a26, b21, b26):
+        c1, c2 = st.columns(2)
+        c1.metric("성심당 방향 (2021→2026)", f"{a26:.1f}%", delta=f"{(a26-a21):+.1f}%p")
+        c2.metric("반대 방향 (2021→2026)", f"{b26:.1f}%", delta=f"{(b26-b21):+.1f}%p")
+
+        st.success(f"격차가 {(a21-b21):+.1f}%p → {(a26-b26):+.1f}%p로 벌어졌다. "
+                   "위약 검정 상위 10.0%로 통과.")
 
     st.markdown("> 반대 방향은 5년간 12~15%에서 거의 움직이지 않았다. "
                 "성심당 방향만 개인 가게가 프랜차이즈로 교체되고 있다.")
     st.caption(ISOTROPY_NOTE)
 
     with st.expander("참고 · 경쟁재(카페·제과) 한정 프랜차이즈 비중 — 표본 작음, 위약검정 미실시"):
-        dfc = load("V_BRANCH_COMPETE")
-        status_badge("V_BRANCH_COMPETE")
-        show = dfc.copy()
-        show["성심당방향"] = show.apply(lambda r: f"{r.ANCHOR_PCT:.1f}% (n={r.ANCHOR_N})", axis=1)
-        show["반대방향"] = show.apply(lambda r: f"{r.OPPO_PCT:.1f}% (n={r.OPPO_N})", axis=1)
-        st.dataframe(show[["YR", "성심당방향", "반대방향"]], use_container_width=True, hide_index=True)
+        dfc = df8[df8.ROLE == "경쟁재"].copy()
+        show = dfc.pivot_table(index="YR", columns="SECTOR",
+                               values=["N", "BRANCH_PCT"], aggfunc="first")
+        table = pd.DataFrame({"YR": sorted(dfc.YR.unique())})
+        for sector in ["성심당방향", "반대방향"]:
+            s = dfc[dfc.SECTOR == sector].set_index("YR")
+            table[sector] = table["YR"].map(
+                lambda y: f"{s.loc[y,'BRANCH_PCT']:.1f}% (n={int(s.loc[y,'N'])})" if y in s.index else "-")
+        st.dataframe(table, use_container_width=True, hide_index=True)
         st.caption(
             "개별 연도는 표본이 작아(n=14~33) 95% 신뢰구간이 겹치며, 단독으로는 통계적 유의성을 주장할 수 없다. "
             "6개년 연속 같은 방향(성심당방향 우세)이라는 경향성만 참고로 제시한다. "
             "위 STEP 8의 전체 업종 프랜차이즈 지표(위약검정 상위 10.0% 통과)가 메인 근거다."
         )
+
+
+# =====================================================================
+# STEP 8.5 · 업소 단위 재검증 — 다른 방법으로도 같은 결론
+# =====================================================================
+
+with st.container(border=True):
+    st.subheader("STEP 8.5 · 업소 단위로 다시 검증해도 같은 결과였다")
+    st.caption("🟢 정적 값 — 개별 업소 로지스틱 회귀·거리곡선 (일회성 분석, Snowpark Python)")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("방향 효과 (OR)", "3.25", delta="p < 0.001", delta_color="off")
+    c2.metric("거리 효과 (OR)", "1.03", delta="p = 0.493 (무의미)", delta_color="off")
+    c3.metric("역U자 곡선 피크", "약 280m", delta="연도 통제해도 동일", delta_color="off")
+
+    st.markdown(
+        "> 개별 업소 10,548건을 로지스틱 회귀로 다시 검증했다. **방향 효과는 매우 유의했지만"
+        "(OR=3.25, p<0.001), 거리 자체는 무의미했다(p=0.493).** "
+        "원형 거리로는 성심당 효과를 못 잡았던 실패 1의 결론을, 업소 단위에서 다시 확인한 셈이다.\n\n"
+        "> 보완재 비중은 성심당 바로 앞이 아니라 **약 280m 지점에서 정점**을 찍는 역U자 곡선을 그린다. "
+        "'후방 집적(spillover)' — 줄 서는 가게 바로 옆이 아니라 한 블록 뒤에 식당가가 형성된다는 뜻이다."
+    )
+    st.caption("※ 이 분석은 Snowflake View가 아닌 1회성 Python 스크립트 결과이며, 재현 시 SQL 뷰로 별도 등록 필요")
 
 
 # =====================================================================
@@ -459,6 +579,12 @@ with st.container(border=True):
 - 상가업소정보는 **개별 업소 장기 추적이 어려움** — 구역 단위 비율 비교로 대체
 - 유동인구·카드 소비 데이터 없음 — "관광객이 실제 매출로 이어지는가"는 검증 못 함
 - 프랜차이즈는 `BRANCH_NM` 유무로 근사한 지표 — 실제 가맹 여부와 다를 수 있음
+- **"소매" 비중이 크게 감소했지만(DiD -13%p)**, ROLE 구성비는 합이 100%에 수렴하는 구조라
+  다른 업종이 늘면 산술적으로 줄어드는 항목일 수 있다. 절대 점포 수 추이 확인 전까지는 보조 참고만
+- **"기타" 항목의 DiD(+8.98%p)가 보완재보다 크지만, 어떤 업종이 포함되는지 세부 확인이 안 됨**
+  — 헤드라인 근거로 사용하지 않음
+- 경쟁재 프랜차이즈의 "6개년 연속 동일 방향" 관찰은 표본이 매년 상당 부분 겹치는 동일 모집단이라,
+  독립시행을 가정한 통계적 유의성 계산(예: (1/2)^6)은 적용할 수 없음 — 경향성 참고로만 사용
         """)
 
 
