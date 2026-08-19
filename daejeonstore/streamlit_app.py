@@ -9,6 +9,16 @@
 #
 # 패키지 추가 불필요 — Streamlit 기본 내장 함수만 사용
 #
+# v4 수정사항
+#   - [버그] 캐시된 load() 안에서 MOCK_MODE를 기록하던 구조 수정
+#     → rerun 시 캐시 히트로 본문이 실행되지 않아 실데이터인데도 🟡 MOCK으로 표시되던 문제
+#     → 조회(_fetch)만 캐시하고, 상태 기록은 캐시 밖 load()에서 수행
+#   - [버그] 실패한 조회가 MOCK과 함께 1시간 캐시되던 문제 → 예외는 캐시되지 않으므로
+#     VIEW 생성 즉시 다음 rerun에서 자동으로 🟢 전환
+#   - 사이드바에 캐시 수동 초기화 버튼 추가
+#   - STEP 1 지도: 실데이터 8만 건 전량 렌더 방지(샘플링)
+#   - .style.applymap → .style.map (pandas 2.1+ deprecation, 구버전 폴백 포함)
+#
 # v3 수정사항
 #   - V_BRANCH_TREND 딕셔너리 닫는 괄호 누락 수정 (구문 오류였음)
 #   - V_BRANCH_TREND 2023년 값 보정치로 교체 (5.90% → 25.84%, 파싱 오류 복구)
@@ -39,18 +49,31 @@ LOAD_ERRORS = {}  # 화면별로 실패 이유 기록 → 디버깅용
 
 # ─────────────────────────────────────────────────────────────────
 # 데이터 로더 — VIEW 없으면 MOCK으로 자동 폴백
+#
+# ★ 중요: 캐시는 "조회"에만 건다.
+#   MOCK_MODE 기록을 캐시된 함수 안에 두면, rerun 시 캐시 히트로 본문이
+#   실행되지 않아 매 rerun마다 초기화되는 MOCK_MODE가 비어 있게 되고,
+#   .get(name, True) 기본값 때문에 실데이터인데도 MOCK으로 표시된다.
 # ─────────────────────────────────────────────────────────────────
 
 FULL_SCHEMA = "PROJECT_DB.SHARED_FILES"  # SHOW VIEWS 결과 기준 확정 경로
 
-@st.cache_data(ttl=3600)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch(view_name: str) -> pd.DataFrame:
+    """Snowflake VIEW 조회만 담당. 예외는 Streamlit이 캐시하지 않으므로
+    실패한 VIEW는 다음 rerun에서 자동 재시도된다."""
+    return session.table(f"{FULL_SCHEMA}.{view_name}").to_pandas()
+
+
 def load(view_name: str) -> pd.DataFrame:
-    """Snowflake VIEW를 읽되, 없거나 접근 실패 시 MOCK 반환"""
+    """VIEW를 읽되, 없거나 접근 실패 시 MOCK 반환. 상태 기록은 여기(캐시 밖)서 한다."""
     if SNOW_OK:
         try:
-            df = session.table(f"{FULL_SCHEMA}.{view_name}").to_pandas()
+            df = _fetch(view_name)
             MOCK_MODE[view_name] = False
-            return df
+            LOAD_ERRORS.pop(view_name, None)
+            return df.copy()   # 캐시 객체 직접 수정 방지
         except Exception as e:
             LOAD_ERRORS[view_name] = str(e)
     MOCK_MODE[view_name] = True
@@ -70,6 +93,13 @@ def status_badge(view_name: str):
             st.caption(f"🟡 MOCK 데이터 사용 중 — `{view_name}` 아직 없음. 태운 님 작업 완료 후 자동 전환됩니다.")
     else:
         st.caption(f"🟢 실데이터 — `{view_name}`")
+
+
+def style_verdict(styler, func, subset):
+    """pandas 2.1+ 는 Styler.map, 그 이전은 Styler.applymap"""
+    if hasattr(styler, "map"):
+        return styler.map(func, subset=subset)
+    return styler.applymap(func, subset=subset)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -284,13 +314,22 @@ with st.container(border=True):
     df1 = load("V_FOOD_CLEAN")
     status_badge("V_FOOD_CLEAN")
 
+    is_mock_1 = MOCK_MODE.get("V_FOOD_CLEAN", True)
+    n_shops = len(df1) if not is_mock_1 else 80824  # MOCK일 때만 참고용 근사치(지도용 500건 샘플 아님)
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("분석 업소", f"{len(df1) if not MOCK_MODE.get('V_FOOD_CLEAN', True) else 80824:,}곳")
+    c1.metric("분석 업소", f"{n_shops:,}곳", delta=("MOCK 근사치" if is_mock_1 else "실데이터 실측"), delta_color="off")
     c2.metric("관측 기간", "1942–2026")
     c3.metric("코호트 연도", "10개 (2014–2023)")
 
     if len(df1) > 0:
-        st.map(df1[["LAT", "LON"]].rename(columns={"LAT": "lat", "LON": "lon"}), size=3)
+        # 실데이터는 8만 건 규모 — 전량 렌더 시 브라우저가 버티지 못하므로 샘플링
+        MAP_SAMPLE_N = 3000
+        map1 = df1[["LAT", "LON"]].dropna()
+        if len(map1) > MAP_SAMPLE_N:
+            map1 = map1.sample(MAP_SAMPLE_N, random_state=42)
+            st.caption(f"지도는 {MAP_SAMPLE_N:,}건 무작위 샘플 표시 (전체 {n_shops:,}곳)")
+        st.map(map1.rename(columns={"LAT": "lat", "LON": "lon"}), size=3)
 
     st.markdown(
         "> 성심당이 대전을 먹여살린다는 얘기는 다들 안다. "
@@ -409,7 +448,7 @@ with st.container(border=True):
                 "경계": "background-color:#fff3cd"}.get(v, "")
 
     st.dataframe(
-        df6.style.applymap(verdict_color, subset=["VERDICT"]),
+        style_verdict(df6.style, verdict_color, ["VERDICT"]),
         use_container_width=True, hide_index=True,
     )
 
@@ -504,13 +543,11 @@ with st.container(border=True):
 
     with st.expander("참고 · 경쟁재(카페·제과) 한정 프랜차이즈 비중 — 표본 작음, 위약검정 미실시"):
         dfc = df8[df8.ROLE == "경쟁재"].copy()
-        show = dfc.pivot_table(index="YR", columns="SECTOR",
-                               values=["N", "BRANCH_PCT"], aggfunc="first")
         table = pd.DataFrame({"YR": sorted(dfc.YR.unique())})
         for sector in ["성심당방향", "반대방향"]:
             s = dfc[dfc.SECTOR == sector].set_index("YR")
             table[sector] = table["YR"].map(
-                lambda y: f"{s.loc[y,'BRANCH_PCT']:.1f}% (n={int(s.loc[y,'N'])})" if y in s.index else "-")
+                lambda y, s=s: f"{s.loc[y,'BRANCH_PCT']:.1f}% (n={int(s.loc[y,'N'])})" if y in s.index else "-")
         st.dataframe(table, use_container_width=True, hide_index=True)
         st.caption(
             "개별 연도는 표본이 작아(n=14~33) 95% 신뢰구간이 겹치며, 단독으로는 통계적 유의성을 주장할 수 없다. "
@@ -535,9 +572,37 @@ with st.container(border=True):
     st.markdown(
         "> 개별 업소 10,548건을 로지스틱 회귀로 다시 검증했다. **방향 효과는 매우 유의했지만"
         "(OR=3.25, p<0.001), 거리 자체는 무의미했다(p=0.493).** "
-        "원형 거리로는 성심당 효과를 못 잡았던 실패 1의 결론을, 업소 단위에서 다시 확인한 셈이다.\n\n"
-        "> 보완재 비중은 성심당 바로 앞이 아니라 **약 280m 지점에서 정점**을 찍는 역U자 곡선을 그린다. "
-        "'후방 집적(spillover)' — 줄 서는 가게 바로 옆이 아니라 한 블록 뒤에 식당가가 형성된다는 뜻이다."
+        "원형 거리로는 성심당 효과를 못 잡았던 실패 1의 결론을, 업소 단위에서 다시 확인한 셈이다."
+    )
+
+    st.divider()
+    st.markdown("**그런데 반박이 하나 남는다 — '어느 방향이든 도심에서 300m쯤 상권이 몰리는 거 아닌가?'**")
+
+    peak_df = pd.DataFrame({
+        "YR":         [2021, 2022, 2023, 2024, 2025, 2026] * 2,
+        "SECTOR":     ["성심당방향"] * 6 + ["반대방향"] * 6,
+        "PEAK_M":     [332, 304, 261, 263, 284, 288,   348, 347, 347, 344, 349, 352],
+        "PEAK_PCT":   [33.9, 36.9, 56.5, 52.4, 43.2, 43.9,   21.0, 22.9, 19.7, 19.5, 21.9, 22.6],
+    })
+
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        st.caption("피크 위치 (m) — 낮을수록 성심당에 가까움")
+        st.line_chart(peak_df.pivot(index="YR", columns="SECTOR", values="PEAK_M"), height=280)
+    with pc2:
+        st.caption("피크 높이 (보완재 비중 %) — 상권 집중도")
+        st.line_chart(peak_df.pivot(index="YR", columns="SECTOR", values="PEAK_PCT"), height=280)
+
+    st.success(
+        "반대 방향은 6년 내내 피크 위치(347~352m)와 높이(19~23%)가 거의 고정돼 있다 — "
+        "**전형적인 '도심 구조 때문' 패턴이다.** "
+        "그런데 성심당 방향은 피크가 332m → 261m(2023) → 288m로 **움직였고**, "
+        "높이도 33.9% → 56.5% → 43.9%로 **급등했다가 내려왔다.** "
+        "'도심이라 원래 그렇다'면 둘 다 고정돼야 하는데, 한쪽만 움직였다."
+    )
+    st.markdown(
+        "> **이게 이 프로젝트에서 가장 강한 인과 증거다.** 도심 구조라는 대안 설명을 이 비교 하나로 기각할 수 있다. "
+        "피크가 가장 가까워지고 가장 높아진 시점이 2023년 — 성심당이 SNS에서 폭발적으로 화제가 된 시점과 겹친다."
     )
     st.caption("※ 이 분석은 Snowflake View가 아닌 1회성 Python 스크립트 결과이며, 재현 시 SQL 뷰로 별도 등록 필요")
 
@@ -555,7 +620,7 @@ with st.container(border=True):
         return {"채택": "background-color:#d4edda", "기각": "background-color:#f8d7da"}.get(v, "")
 
     st.dataframe(
-        df9.style.applymap(verdict_color9, subset=["VERDICT"]),
+        style_verdict(df9.style, verdict_color9, ["VERDICT"]),
         use_container_width=True, hide_index=True,
     )
 
@@ -595,6 +660,11 @@ with st.container(border=True):
 with st.sidebar:
     st.header("개발 상태")
     st.write("Snowflake 연결:", "🟢 연결됨" if SNOW_OK else "🔴 미연결 (로컬 테스트)")
+
+    if st.button("🔄 캐시 비우고 다시 읽기", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
     st.divider()
     st.caption("VIEW별 데이터 소스")
     for v in sorted(set(MOCK.keys())):
